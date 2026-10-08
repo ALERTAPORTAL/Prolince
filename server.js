@@ -293,16 +293,23 @@ app.get('/api/auth/verify', (req, res) => {
 // JETIX — /api/auth/redeem (POST) — Resgatar key JETIX
 // ═══════════════════════════════════════════════════════════════
 app.post('/api/auth/redeem', async (req, res) => {
-  const { code, fingerprint } = req.body || {};
-  log('JETIX', `redeem code=${code} fp=${(fingerprint||'').substring(0,12)}...`);
-  if (!code) return res.status(400).json({ error: 'missing_code' });
-  const key = normalizeKey(code);
-  const lic = await redisGet(key);
-  if (!lic) return res.status(404).json({ error: 'invalid_license' });
-  if (!lic.ativa) return res.status(403).json({ error: 'revoked' });
-  if (!lic.lifetime && Date.now() > lic.expiraEm) return res.status(403).json({ error: 'expired' });
-  if (!lic.installId) { lic.installId = fingerprint; lic.ativadaEm = Date.now(); await redisSet(key, JSON.stringify(lic)); }
-  return res.json({ success: true, data: { tier: 'premium', plan: lic.plano, expiresAt: lic.expiraEm, licenseKey: key } });
+  try {
+    const { code, fingerprint } = req.body || {};
+    log('JETIX', `redeem code=${code} fp=${(fingerprint||'').substring(0,12)}...`);
+    if (!code) return res.status(400).json({ error: 'missing_code' });
+    if (!UPSTASH_URL || !UPSTASH_TOKEN) return res.status(500).json({ error: 'redis_not_configured' });
+    const key = normalizeKey(code);
+    const lic = await redisGet(key);
+    if (!lic) { log('WARN', `redeem: ${key} nao encontrada`); return res.status(404).json({ error: 'invalid_license' }); }
+    if (!lic.ativa) return res.status(403).json({ error: 'revoked' });
+    if (!lic.lifetime && Date.now() > lic.expiraEm) return res.status(403).json({ error: 'expired' });
+    if (!lic.installId) { lic.installId = fingerprint; lic.ativadaEm = Date.now(); await redisSet(key, JSON.stringify(lic)); }
+    log('OK', `redeem OK: ${key} -> ${fingerprint}`);
+    return res.json({ success: true, data: { tier: 'premium', plan: lic.plano, expiresAt: lic.expiraEm, licenseKey: key, user: { id: 1, username: 'prolince_user', effective_tier: 'premium', effective_status: 'active', has_active_extension: true, has_active_credit: true } } });
+  } catch (e) {
+    log('ERRO', 'redeem: ' + e.message);
+    return res.status(500).json({ error: 'internal_error', message: e.message });
+  }
 });
 
 // ═══════════════════════════════════════════════════════════════
