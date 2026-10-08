@@ -1,6 +1,6 @@
 /* ═══════════════════════════════════════════════════════════════
    ✦ PROLINCE  ·  v1.0.0
-   License Server · Telegram Bot · Chrome Extension API
+   License Server · Telegram Bot · Jetix Extension API
    ═══════════════════════════════════════════════════════════════ */
 require('dotenv').config();
 const express = require('express');
@@ -9,21 +9,25 @@ const crypto = require('crypto');
 const fs = require('fs');
 
 const app = express();
-app.use(express.json({ limit: '1mb' }));
+app.use(express.json({ limit: '2mb' }));
 app.use((req, res, next) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+  res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, PATCH, OPTIONS');
   res.setHeader('Access-Control-Allow-Headers', '*');
+  res.setHeader('Access-Control-Expose-Headers', '*');
+  res.setHeader('Access-Control-Max-Age', '86400');
   if (req.method === 'OPTIONS') return res.sendStatus(204);
   next();
 });
 
+// ═══════════════════════════════════════════════════════════════
+// ENV
+// ═══════════════════════════════════════════════════════════════
 const UPSTASH_URL    = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN  = process.env.UPSTASH_REDIS_REST_TOKEN;
 const TELEGRAM_TOKEN = process.env.TELEGRAM_TOKEN;
 const OWNER_ID       = process.env.OWNER_ID;
 
-// ── Chaves EC: Secret File primeiro, depois env, depois base64 ──
 function loadKey(name) {
   const paths = [`/etc/secrets/${name}`, `./${name}`, `/etc/secrets/${name.toLowerCase()}.pem`, `./${name.toLowerCase()}.pem`];
   for (const p of paths) { try { if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8').trim(); } catch {} }
@@ -38,7 +42,7 @@ const PUBLIC_KEY  = loadKey('EC_PUBLIC_KEY');
 const log = (tag, msg) => console.log(`[${new Date().toISOString().substring(11,19)}] ▸ ${tag.padEnd(6)} ${msg}`);
 
 // ═══════════════════════════════════════════════════════════════
-// REDIS — Upstash REST
+// REDIS
 // ═══════════════════════════════════════════════════════════════
 function normalizeKey(k) { if (!k || typeof k !== 'string') return ''; return k.trim().toUpperCase().replace(/\s+/g,'').replace(/[^A-Z0-9\-]/g,''); }
 async function redisSet(key, value) {
@@ -92,15 +96,51 @@ function progressBar(pct, size=10) { pct = Math.max(0, Math.min(100, pct)); cons
 const PACOTES = {
   '3d':   { nome:'3 Dias',   dias:3,    preco:3,   emoji:'o', lifetime:false },
   '7d':   { nome:'7 Dias',   dias:7,    preco:5,   emoji:'o', lifetime:false },
-  '15d':  { nome:'15 Dias',  dias:15,   preco:7,   emoji:'o', lifetime:false },
   '30d':  { nome:'30 Dias',  dias:30,   preco:12,  emoji:'o', lifetime:false },
-  '45d':  { nome:'45 Dias',  dias:45,   preco:17,  emoji:'o', lifetime:false },
   '90d':  { nome:'3 Meses',  dias:90,   preco:30,  emoji:'*', lifetime:false },
-  '180d': { nome:'6 Meses',  dias:180,  preco:45,  emoji:'*', lifetime:false },
   '1a':   { nome:'1 Ano',    dias:365,  preco:70,  emoji:'*', lifetime:false },
   'life': { nome:'LIFETIME', dias:36500, preco:190, emoji:'inf', lifetime:true },
 };
 const precoFmt = usd => `$${Number(usd).toFixed(2)}`;
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX ECDH — Handshake
+// ═══════════════════════════════════════════════════════════════
+const SESSIONS = new Map(); // sessionId -> { key: CryptoKey, fingerprint, createdAt }
+const SERVER_ECDH = crypto.generateKeyPairSync('ec', { namedCurve: 'prime256v1' });
+
+function base64ToBuffer(b64) { return Buffer.from(b64, 'base64'); }
+function bufferToBase64(buf) { return Buffer.from(buf).toString('base64'); }
+
+async function deriveSessionKey(clientPubRaw) {
+  // Importa a public key do cliente (raw, uncompressed P-256)
+  const clientKey = crypto.createPublicKey({
+    key: Buffer.concat([Buffer.from('3059301306072a8648ce3d020106082a8648ce3d030107034200', 'hex'), base64ToBuffer(clientPubRaw)]),
+    format: 'der', type: 'spki'
+  });
+  // ECDH
+  const shared = crypto.diffieHellman({ privateKey: SERVER_ECDH.privateKey, publicKey: clientKey });
+  // HKDF-SHA256 com info "jetix-v2.5-ecdhe-session-key"
+  const hkdf = crypto.hkdfSync('sha256', shared, Buffer.alloc(0), Buffer.from('jetix-v2.5-ecdhe-session-key'), 32);
+  return Buffer.from(hkdf);
+}
+
+function aesGcmEncrypt(key, plaintext) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const enc = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return Buffer.concat([iv, enc, tag]).toString('base64');
+}
+function aesGcmDecrypt(key, b64) {
+  const buf = Buffer.from(b64, 'base64');
+  const iv = buf.subarray(0, 12);
+  const tag = buf.subarray(buf.length - 16);
+  const enc = buf.subarray(12, buf.length - 16);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+  decipher.setAuthTag(tag);
+  return Buffer.concat([decipher.update(enc), decipher.final()]).toString('utf8');
+}
 
 // ═══════════════════════════════════════════════════════════════
 // TELEGRAM
@@ -118,40 +158,20 @@ const SUPPORT_SESSIONS = new Map();
 const USER_LANG = new Map();
 setInterval(() => { const now = Date.now(); for (const [k,v] of SUPPORT_SESSIONS.entries()) if (now - v.ts > 10*60*1000) SUPPORT_SESSIONS.delete(k); }, 60000);
 
-const T = {
-  pt: { menu_title:'PAINEL DE CONTROLE', menu_sub:'Selecione uma operação abaixo', online:'online', secure:'seguro', btn_generate:'Gerar Licenca', btn_mykeys:'Minhas Chaves', btn_stats:'Estatisticas', btn_link:'Vincular', btn_unlink:'Desvincular', btn_query:'Consultar', btn_prices:'Tabela de Precos', btn_support:'Suporte', btn_lang:'Idioma', btn_help:'Ajuda', btn_danger:'Zona de Perigo', btn_back:'Voltar', btn_menu:'Menu', btn_refresh:'Atualizar', btn_cancel:'Cancelar', welcome_title:'Bem-vindo ao Prolince', welcome_desc:'Para adquirir uma licenca premium, clique abaixo:', contact:'CONTACTAR SUPORTE', support_title:'Suporte', support_write:'Escreva sua mensagem agora:', support_sent:'MENSAGEM ENVIADA', support_cancelled:'Suporte cancelado', gen_title:'Gerar Licenca', gen_sub:'Escolha um plano abaixo:', gen_success:'LICENCA EMITIDA', gen_key:'Chave', gen_plan:'Plano', gen_price:'Preco', gen_issued:'Emitida', gen_expires:'Expira', gen_duration:'Duracao', gen_lifetime:'Lifetime', gen_never:'Nunca', list_title:'Minhas Licencas', list_empty:'Nenhuma licenca cadastrada.', stats_title:'Estatisticas', stats_total:'Total', stats_active:'Ativas', stats_expired:'Expiradas', stats_linked:'Vinculadas', stats_lifetime:'Lifetime', stats_revenue:'Receita', detail_title:'Detalhes da Licenca', detail_key:'Chave', detail_status:'Status', detail_active:'Ativa', detail_revoked:'Revogada', detail_install:'Install ID', detail_not_linked:'nao vinculada', detail_remaining:'Restante', act_link:'Vincular', act_unlink:'Desvincular', act_revoke:'Revogar', act_delete:'Deletar', prices_title:'Tabela de Precos', help_title:'Central de Ajuda' },
-  en: { menu_title:'CONTROL PANEL', menu_sub:'Select an operation below', online:'online', secure:'secure', btn_generate:'Generate License', btn_mykeys:'My Keys', btn_stats:'Statistics', btn_link:'Link', btn_unlink:'Unlink', btn_query:'Query', btn_prices:'Price List', btn_support:'Support', btn_lang:'Language', btn_help:'Help', btn_danger:'Danger Zone', btn_back:'Back', btn_menu:'Menu', btn_refresh:'Refresh', btn_cancel:'Cancel', welcome_title:'Welcome to Prolince', welcome_desc:'To purchase a premium license, click below:', contact:'CONTACT SUPPORT', support_title:'Support', support_write:'Write your message now:', support_sent:'MESSAGE SENT', support_cancelled:'Support cancelled', gen_title:'Generate License', gen_sub:'Choose a plan below:', gen_success:'LICENSE ISSUED', gen_key:'Key', gen_plan:'Plan', gen_price:'Price', gen_issued:'Issued', gen_expires:'Expires', gen_duration:'Duration', gen_lifetime:'Lifetime', gen_never:'Never', list_title:'My Licenses', list_empty:'No licenses found.', stats_title:'Statistics', stats_total:'Total', stats_active:'Active', stats_expired:'Expired', stats_linked:'Linked', stats_lifetime:'Lifetime', stats_revenue:'Revenue', detail_title:'License Details', detail_key:'Key', detail_status:'Status', detail_active:'Active', detail_revoked:'Revoked', detail_install:'Install ID', detail_not_linked:'not linked', detail_remaining:'Remaining', act_link:'Link', act_unlink:'Unlink', act_revoke:'Revoke', act_delete:'Delete', prices_title:'Price List', help_title:'Help Center' }
-};
-function t(lang, key, vars={}) { let s = (T[lang] || T.pt)[key] || T.pt[key] || key; for (const k in vars) s = s.replace(`{${k}}`, vars[k]); return s; }
-
-function menuPrincipal(lang='pt') {
-  return { texto: `<b>PROLINCE  v1.0.0</b>\n<i>License Engine</i>\n\n<b>${t(lang,'menu_title')}</b>\n<code>----------------------</code>\n<i>${t(lang,'menu_sub')}</i>`, teclado: { inline_keyboard: [
-    [{ text: t(lang,'btn_generate'), callback_data:'m_gerar' }],
-    [{ text: t(lang,'btn_mykeys'), callback_data:'m_listar' }, { text: t(lang,'btn_stats'), callback_data:'m_stats' }],
-    [{ text: t(lang,'btn_query'), callback_data:'m_consultar' }],
-    [{ text: t(lang,'btn_prices'), callback_data:'m_precos' }],
-    [{ text: t(lang,'btn_support'), callback_data:'m_contacto' }],
-    [{ text: t(lang,'btn_lang'), callback_data:'m_lang' }],
-    [{ text: t(lang,'btn_help'), callback_data:'m_ajuda' }, { text: t(lang,'btn_danger'), callback_data:'m_perigo' }]
+function menuPrincipal() {
+  return { texto: `<b>PROLINCE  v1.0.0</b>\n<i>License Engine</i>`, teclado: { inline_keyboard: [
+    [{ text:'⚡ Gerar Licenca', callback_data:'m_gerar' }],
+    [{ text:'◈ Minhas Chaves', callback_data:'m_listar' }, { text:'◧ Estatisticas', callback_data:'m_stats' }],
+    [{ text:'◉ Consultar', callback_data:'m_consultar' }],
+    [{ text:'? Ajuda', callback_data:'m_ajuda' }]
   ] } };
 }
-async function cmdStart(chatId, msgId=null) { const lang = USER_LANG.get(String(chatId)) || 'pt'; const m = menuPrincipal(lang); if (msgId) await tgEdit(chatId, msgId, m.texto, m.teclado); else await tgSend(chatId, m.texto, m.teclado); }
+async function cmdStart(chatId, msgId=null) { const m = menuPrincipal(); if (msgId) await tgEdit(chatId, msgId, m.texto, m.teclado); else await tgSend(chatId, m.texto, m.teclado); }
 
 async function handleCallback(cb) {
   const chatId = cb.message.chat.id, msgId = cb.message.message_id, data = cb.data, userId = String(cb.from.id);
   const isOwner = userId === String(OWNER_ID);
-  const lang = USER_LANG.get(String(chatId)) || 'pt';
-
-  if (data === 'm_lang') { await tgAnswer(cb.id); const kb = { inline_keyboard: [[{text:'Portugues',callback_data:'lang_pt'},{text:'English',callback_data:'lang_en'}],[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }; await tgEdit(chatId, msgId, `<b>PROLINCE</b>\n\n<b>Idioma / Language</b>`, kb); return; }
-  if (data === 'lang_pt' || data === 'lang_en') { const novo = data === 'lang_pt' ? 'pt' : 'en'; USER_LANG.set(String(chatId), novo); await tgAnswer(cb.id, 'ok'); const m = menuPrincipal(novo); await tgEdit(chatId, msgId, m.texto, m.teclado); return; }
-
-  if (!isOwner) {
-    if (data === 'm_contacto') { SUPPORT_SESSIONS.set(String(chatId), { step:'waiting', ts: Date.now() }); await tgAnswer(cb.id, 'ok'); await tgEdit(chatId, msgId, `<b>${t(lang,'support_title')}</b>\n\n${t(lang,'support_write')}`, { inline_keyboard: [[{text:t(lang,'btn_cancel'),callback_data:'m_cancelar_suporte'}]] }); return; }
-    if (data === 'm_cancelar_suporte') { SUPPORT_SESSIONS.delete(String(chatId)); await tgAnswer(cb.id, 'x'); await cmdStart(chatId, msgId); return; }
-    if (data === 'm_home') { await tgAnswer(cb.id); await tgEdit(chatId, msgId, `<b>PROLINCE</b>\n\n${t(lang,'welcome_desc')}`, { inline_keyboard: [[{text:t(lang,'contact'),callback_data:'m_contacto'}]] }); return; }
-    await tgAnswer(cb.id, 'x'); return;
-  }
-
+  if (!isOwner) { await tgAnswer(cb.id, 'x'); return; }
   try {
     if (data === 'm_home') { await tgAnswer(cb.id); return cmdStart(chatId, msgId); }
     if (data === 'm_gerar') {
@@ -163,8 +183,8 @@ async function handleCallback(cb) {
         if (entries[i+1]) linha.push({ text: `${entries[i+1][1].nome} - ${precoFmt(entries[i+1][1].preco)}`, callback_data:`g_${entries[i+1][0]}` });
         kb.inline_keyboard.push(linha);
       }
-      kb.inline_keyboard.push([{ text: t(lang,'btn_back'), callback_data:'m_home' }]);
-      await tgEdit(chatId, msgId, `<b>${t(lang,'gen_title')}</b>\n\n<i>${t(lang,'gen_sub')}</i>`, kb);
+      kb.inline_keyboard.push([{ text: '‹ Menu', callback_data:'m_home' }]);
+      await tgEdit(chatId, msgId, `<b>Gerar Licenca</b>\n<i>Escolha um plano:</i>`, kb);
       return;
     }
     if (data.startsWith('g_')) {
@@ -176,24 +196,13 @@ async function handleCallback(cb) {
       await redisSet(chave, JSON.stringify({ chave, plano:pk, planoNome:p.nome, preco:p.preco, dias:p.dias, lifetime:p.lifetime===true, criadaEm:agora, expiraEm:expira, ativa:true, installId:null, ativadaEm:null, v:1 }));
       log('OK', `Chave ${pk} gerada: ${chave}`);
       await tgAnswer(cb.id, 'ok');
-      await tgEdit(chatId, msgId, `<b>${t(lang,'gen_success')}</b>\n<code>----------------------</code>\n\n<b>${t(lang,'gen_key')}</b>\n<code>${chave}</code>\n\n<code>----------------------</code>\n<b>${p.nome}</b>\n<b>$</b> ${t(lang,'gen_price')}: ${precoFmt(p.preco)}\n<b>o</b> ${t(lang,'gen_issued')}: ${formatDate(agora)}\n<b>o</b> ${t(lang,'gen_expires')}: ${p.lifetime ? t(lang,'gen_never') : formatDate(expira)}`, { inline_keyboard: [[{text:t(lang,'btn_query'),callback_data:`c_${chave}`}],[{text:t(lang,'btn_menu'),callback_data:'m_home'}]] });
+      await tgEdit(chatId, msgId, `<b>LICENCA EMITIDA</b>\n\n<b>Chave:</b>\n<code>${chave}</code>\n\n<b>${p.nome}</b> - ${precoFmt(p.preco)}\nExpira: ${p.lifetime ? 'Nunca' : formatDate(expira)}`, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] });
       return;
     }
-    if (data === 'm_listar') { await tgAnswer(cb.id, 'ok'); const keys = await redisKeys('JETIX-*'); if (keys.length === 0) { await tgEdit(chatId, msgId, `<b>${t(lang,'list_title')}</b>\n\n<i>${t(lang,'list_empty')}</i>`, { inline_keyboard: [[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); return; } let txt = `<b>${t(lang,'list_title')} (${keys.length})</b>\n<code>----------------------</code>\n`; const inlineKb = []; for (let i = 0; i < Math.min(keys.length, 15); i++) { const l = await redisGet(keys[i]); if (!l) continue; const exp = l.lifetime ? 'inf' : humanTime((l.expiraEm||0) - Date.now()); txt += `<b>${l.ativa?'o':'x'}</b> <code>${keys[i]}</code>\n<i>${l.planoNome} - ${exp}</i>\n`; inlineKb.push([{text:`> ${keys[i].substring(0,18)}...`,callback_data:`c_${keys[i]}`}]); } inlineKb.push([{text:t(lang,'btn_refresh'),callback_data:'m_listar'},{text:t(lang,'btn_back'),callback_data:'m_home'}]); await tgEdit(chatId, msgId, txt, { inline_keyboard: inlineKb }); return; }
-    if (data === 'm_stats') { await tgAnswer(cb.id, 'ok'); const keys = await redisKeys('JETIX-*'); let ativas=0, expiradas=0, vinc=0, life=0, receita=0; for (const k of keys) { const l = await redisGet(k); if (!l) continue; if (l.ativa) ativas++; if (!l.lifetime && l.expiraEm < Date.now()) expiradas++; if (l.installId) vinc++; if (l.lifetime) life++; if (l.preco) receita += Number(l.preco)||0; } const taxa = keys.length ? Math.round((ativas/keys.length)*100) : 0; await tgEdit(chatId, msgId, `<b>${t(lang,'stats_title')}</b>\n<code>----------------------</code>\n<b>#</b> ${t(lang,'stats_total')}: <code>${keys.length}</code>\n<b>o</b> ${t(lang,'stats_active')}: <code>${ativas}</code>\n<b>x</b> ${t(lang,'stats_expired')}: <code>${expiradas}</code>\n<b>*</b> ${t(lang,'stats_linked')}: <code>${vinc}</code>\n<b>inf</b> ${t(lang,'stats_lifetime')}: <code>${life}</code>\n<b>$</b> ${t(lang,'stats_revenue')}: <code>${precoFmt(receita)}</code>\n<code>${progressBar(taxa,15)}</code> ${taxa}%`, { inline_keyboard: [[{text:t(lang,'btn_refresh'),callback_data:'m_stats'},{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); return; }
-    if (data === 'm_consultar') { await tgAnswer(cb.id); return tgEdit(chatId, msgId, `<b>${t(lang,'btn_query')}</b>\n<code>----------------------</code>\n<code>/status &lt;chave&gt;</code>`, { inline_keyboard: [[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); }
-    if (data === 'm_precos') { await tgAnswer(cb.id); let txt = `<b>${t(lang,'prices_title')}</b>\n<code>----------------------</code>\n`; for (const [,p] of Object.entries(PACOTES)) { txt += `<b>${p.nome}</b> - <code>${precoFmt(p.preco)}</code>\n`; } await tgEdit(chatId, msgId, txt, { inline_keyboard: [[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); return; }
-    if (data === 'm_contacto') { await tgAnswer(cb.id, 'ok'); SUPPORT_SESSIONS.set(String(chatId), { step:'waiting', ts: Date.now() }); await tgEdit(chatId, msgId, `<b>${t(lang,'support_title')}</b>\n\n${t(lang,'support_write')}`, { inline_keyboard: [[{text:t(lang,'btn_cancel'),callback_data:'m_cancelar_suporte'}]] }); return; }
-    if (data === 'm_cancelar_suporte') { SUPPORT_SESSIONS.delete(String(chatId)); await tgAnswer(cb.id, 'x'); return cmdStart(chatId, msgId); }
-    if (data === 'm_ajuda') { await tgAnswer(cb.id); await tgEdit(chatId, msgId, `<b>${t(lang,'help_title')}</b>\n<code>----------------------</code>\n<code>/start</code> Menu\n<code>/gerar</code> Gerar\n<code>/listar</code> Listar\n<code>/stats</code> Estatisticas\n<code>/status &lt;k&gt;</code>\n<code>/revogar &lt;k&gt;</code>\n<code>/deletar &lt;k&gt;</code>\n<code>/resp &lt;id&gt; &lt;msg&gt;</code>`, { inline_keyboard: [[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); return; }
-    if (data === 'm_perigo') { await tgAnswer(cb.id, '!'); await tgEdit(chatId, msgId, `<b>${t(lang,'btn_danger')}</b>\n<code>----------------------</code>`, { inline_keyboard: [[{text:'Deletar ativas',callback_data:'danger_ativas'}],[{text:'Deletar TUDO',callback_data:'danger_tudo'}],[{text:t(lang,'btn_back'),callback_data:'m_home'}]] }); return; }
-    if (data === 'danger_ativas') { await tgAnswer(cb.id); return tgEdit(chatId, msgId, `Confirmar: deletar ativas?`, { inline_keyboard: [[{text:'Sim',callback_data:'confirm_ativas'},{text:'Nao',callback_data:'m_perigo'}]] }); }
-    if (data === 'danger_tudo') { await tgAnswer(cb.id); return tgEdit(chatId, msgId, `Confirmar: deletar TUDO?`, { inline_keyboard: [[{text:'Sim',callback_data:'confirm_tudo'},{text:'Nao',callback_data:'m_perigo'}]] }); }
-    if (data === 'confirm_ativas') { await tgAnswer(cb.id); const keys = await redisKeys('JETIX-*'); let n=0; for (const k of keys) { const l = await redisGet(k); if (l && l.ativa) { await redisDel(k); n++; } } return tgEdit(chatId, msgId, `OK  ${n} licencas removidas.`, { inline_keyboard: [[{text:t(lang,'btn_menu'),callback_data:'m_home'}]] }); }
-    if (data === 'confirm_tudo') { await tgAnswer(cb.id); const keys = await redisKeys('JETIX-*'); for (const k of keys) await redisDel(k); return tgEdit(chatId, msgId, `OK  ${keys.length} licencas removidas.`, { inline_keyboard: [[{text:t(lang,'btn_menu'),callback_data:'m_home'}]] }); }
-    if (data.startsWith('c_')) { const k = data.substring(2), l = await redisGet(k); if (!l) { await tgAnswer(cb.id, 'x'); return; } await tgAnswer(cb.id); const resta = l.lifetime ? 'inf' : humanTime((l.expiraEm||0)-Date.now()); await tgEdit(chatId, msgId, `<b>${t(lang,'detail_title')}</b>\n<code>----------------------</code>\n<b>${t(lang,'detail_key')}</b>\n<code>${k}</code>\n<code>----------------------</code>\n<b>${l.planoNome}</b>\n<b>$</b> ${precoFmt(l.preco)}\n<b>o</b> ${formatDate(l.criadaEm)}\n<b>o</b> ${l.lifetime?t(lang,'gen_never'):formatDate(l.expiraEm)}\n<b>*</b> ${resta}\n<b>o</b> ${l.ativa?t(lang,'detail_active'):t(lang,'detail_revoked')}`, { inline_keyboard: [[{text:t(lang,'act_revoke'),callback_data:`rv_${k}`},{text:t(lang,'act_delete'),callback_data:`dl_${k}`}],[{text:t(lang,'btn_menu'),callback_data:'m_home'}]] }); return; }
-    if (data.startsWith('rv_')) { const k = data.substring(3), l = await redisGet(k); if (l) { l.ativa = false; await redisSet(k, JSON.stringify(l)); } await tgAnswer(cb.id, 'x'); return tgEdit(chatId, msgId, `OK Revogada`, { inline_keyboard: [[{text:t(lang,'btn_back'),callback_data:`c_${k}`}]] }); }
-    if (data.startsWith('dl_')) { const k = data.substring(3); await redisDel(k); await tgAnswer(cb.id, 'x'); return tgEdit(chatId, msgId, `OK Deletada`, { inline_keyboard: [[{text:t(lang,'btn_menu'),callback_data:'m_home'}]] }); }
+    if (data === 'm_listar') { await tgAnswer(cb.id, 'ok'); const keys = await redisKeys('JETIX-*'); if (keys.length === 0) { await tgEdit(chatId, msgId, `<b>Minhas Chaves</b>\n\n<i>Nenhuma licenca.</i>`, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] }); return; } let txt = `<b>Minhas Chaves (${keys.length})</b>\n\n`; for (let i = 0; i < Math.min(keys.length, 15); i++) { const l = await redisGet(keys[i]); if (!l) continue; txt += `<b>${l.ativa?'o':'x'}</b> <code>${keys[i]}</code>\n<i>${l.planoNome}</i>\n`; } await tgEdit(chatId, msgId, txt, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] }); return; }
+    if (data === 'm_stats') { await tgAnswer(cb.id, 'ok'); const keys = await redisKeys('JETIX-*'); let ativas=0, expiradas=0, life=0, receita=0; for (const k of keys) { const l = await redisGet(k); if (!l) continue; if (l.ativa) ativas++; if (!l.lifetime && l.expiraEm < Date.now()) expiradas++; if (l.lifetime) life++; if (l.preco) receita += Number(l.preco)||0; } await tgEdit(chatId, msgId, `<b>Estatisticas</b>\n\nTotal: <code>${keys.length}</code>\nAtivas: <code>${ativas}</code>\nExpiradas: <code>${expiradas}</code>\nLifetime: <code>${life}</code>\nReceita: <code>${precoFmt(receita)}</code>`, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] }); return; }
+    if (data === 'm_consultar') { await tgAnswer(cb.id); return tgEdit(chatId, msgId, `<b>Consultar</b>\n\n<code>/status &lt;chave&gt;</code>`, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] }); }
+    if (data === 'm_ajuda') { await tgAnswer(cb.id); await tgEdit(chatId, msgId, `<b>Ajuda</b>\n\n<code>/start</code>\n<code>/gerar</code>\n<code>/listar</code>\n<code>/stats</code>\n<code>/status &lt;k&gt;</code>\n<code>/revogar &lt;k&gt;</code>\n<code>/deletar &lt;k&gt;</code>`, { inline_keyboard: [[{text:'‹ Menu',callback_data:'m_home'}]] }); return; }
     await tgAnswer(cb.id);
   } catch (e) { log('ERRO', 'Callback: ' + e.message); try { await tgAnswer(cb.id, 'x'); } catch {} }
 }
@@ -204,49 +213,125 @@ async function handleMessage(msg) {
   const args = texto.replace(/\n/g,' ').split(' ').filter(a=>a.length>0);
   const cmd = (args[0] || '').toLowerCase();
   const isOwner = userId === String(OWNER_ID);
-  const lang = USER_LANG.get(String(chatId)) || 'pt';
-  const sessao = SUPPORT_SESSIONS.get(String(chatId));
-
-  if (sessao && sessao.step === 'waiting') {
-    if (cmd === '/cancelar') { SUPPORT_SESSIONS.delete(String(chatId)); await tgSend(chatId, t(lang,'support_cancelled')); return; }
-    SUPPORT_SESSIONS.delete(String(chatId));
-    const userInfo = `${msg.from.first_name||''} ${msg.from.last_name||''}`.trim() || 'Sem nome';
-    await tgSend(chatId, `<b>${t(lang,'support_sent')}</b>`);
-    if (!isOwner) await tgSend(OWNER_ID, `<b>NOVA MENSAGEM</b>\n<b>Nome:</b> ${userInfo}\n<b>Chat ID:</b> <code>${chatId}</code>\n\n${texto}\n\n<i>Responda com:</i>\n<code>/resp ${chatId} msg</code>`);
-    return;
-  }
-
   if (!isOwner) {
-    if (cmd === '/start' || cmd === '/ajuda' || cmd === '/help' || cmd === '/lang') {
-      if (cmd === '/lang') { await tgSend(chatId, `Idioma:`, { inline_keyboard: [[{text:'Portugues',callback_data:'lang_pt'},{text:'English',callback_data:'lang_en'}]] }); return; }
-      await tgSend(chatId, `<b>PROLINCE</b>\n\n${t(lang,'welcome_desc')}`, { inline_keyboard: [[{text:t(lang,'contact'),callback_data:'m_contacto'}]] });
-      return;
-    }
+    if (cmd === '/start' || cmd === '/ajuda') await tgSend(chatId, `<b>PROLINCE</b>\n\nUse /start`);
     return;
   }
-
   try {
     if (cmd === '/start' || cmd === '/menu') { await cmdStart(chatId); return; }
-    if (cmd === '/lang') { await tgSend(chatId, `Idioma:`, { inline_keyboard: [[{text:'Portugues',callback_data:'lang_pt'},{text:'English',callback_data:'lang_en'}]] }); return; }
-    if (cmd === '/resp') { const target = args[1]; const resposta = args.slice(2).join(' '); if (!target || !resposta) { await tgSend(chatId, `/resp <chatId> <msg>`); return; } await tgSend(target, `<b>RESPOSTA DO SUPORTE</b>\n\n${resposta}`); await tgSend(chatId, `OK enviado para <code>${target}</code>`); return; }
-    if (cmd === '/gerar') { const kb = { inline_keyboard: [] }; const entries = Object.entries(PACOTES); for (let i = 0; i < entries.length; i += 2) { const linha = [{text:`${entries[i][1].nome} - ${precoFmt(entries[i][1].preco)}`,callback_data:`g_${entries[i][0]}`}]; if (entries[i+1]) linha.push({text:`${entries[i+1][1].nome} - ${precoFmt(entries[i+1][1].preco)}`,callback_data:`g_${entries[i+1][0]}`}); kb.inline_keyboard.push(linha); } await tgSend(chatId, `<b>${t(lang,'gen_title')}</b>`, kb); return; }
-    if (cmd === '/listar') { const keys = await redisKeys('JETIX-*'); if (keys.length === 0) { await tgSend(chatId, t(lang,'list_empty')); return; } let txt = `<b>${t(lang,'list_title')} (${keys.length})</b>\n`; for (let i = 0; i < Math.min(keys.length, 30); i++) { const l = await redisGet(keys[i]); if (!l) continue; const exp = l.lifetime ? 'inf' : humanTime((l.expiraEm||0)-Date.now()); txt += `<b>${l.ativa?'o':'x'}</b> <code>${keys[i]}</code>\n<i>${l.planoNome} - ${exp}</i>\n`; } await tgSend(chatId, txt); return; }
-    if (cmd === '/status') { const k = args[1]; if (!k) { await tgSend(chatId, `/status <chave>`); return; } const l = await redisGet(k); if (!l) { await tgSend(chatId, `Nao encontrada`); return; } const resta = l.lifetime ? 'inf' : humanTime((l.expiraEm||0)-Date.now()); await tgSend(chatId, `<b>${t(lang,'detail_title')}</b>\n<b>${t(lang,'detail_key')}:</b> <code>${k}</code>\n<b>${l.planoNome}</b>\n<b>$</b> ${precoFmt(l.preco)}\n<b>o</b> ${formatDate(l.criadaEm)}\n<b>o</b> ${l.lifetime?t(lang,'gen_never'):formatDate(l.expiraEm)}\n<b>*</b> ${resta}\n<b>o</b> ${l.ativa?t(lang,'detail_active'):t(lang,'detail_revoked')}`); return; }
+    if (cmd === '/gerar') { const kb = { inline_keyboard: [] }; const entries = Object.entries(PACOTES); for (let i = 0; i < entries.length; i += 2) { const linha = [{text:`${entries[i][1].nome} - ${precoFmt(entries[i][1].preco)}`,callback_data:`g_${entries[i][0]}`}]; if (entries[i+1]) linha.push({text:`${entries[i+1][1].nome} - ${precoFmt(entries[i+1][1].preco)}`,callback_data:`g_${entries[i+1][0]}`}); kb.inline_keyboard.push(linha); } await tgSend(chatId, `<b>Gerar Licenca</b>`, kb); return; }
+    if (cmd === '/listar') { const keys = await redisKeys('JETIX-*'); if (keys.length === 0) { await tgSend(chatId, `Nenhuma licenca.`); return; } let txt = `<b>Minhas Chaves (${keys.length})</b>\n`; for (let i = 0; i < Math.min(keys.length, 30); i++) { const l = await redisGet(keys[i]); if (!l) continue; txt += `<b>${l.ativa?'o':'x'}</b> <code>${keys[i]}</code> - <i>${l.planoNome}</i>\n`; } await tgSend(chatId, txt); return; }
+    if (cmd === '/status') { const k = args[1]; if (!k) { await tgSend(chatId, `/status <chave>`); return; } const l = await redisGet(k); if (!l) { await tgSend(chatId, `Nao encontrada`); return; } await tgSend(chatId, `<b>Detalhes</b>\n<code>${k}</code>\n${l.planoNome}\n${precoFmt(l.preco)}\nEmitida: ${formatDate(l.criadaEm)}\nExpira: ${l.lifetime?'Nunca':formatDate(l.expiraEm)}\nStatus: ${l.ativa?'Ativa':'Revogada'}`); return; }
     if (cmd === '/revogar') { const k = args[1]; if (!k) return tgSend(chatId, `/revogar <chave>`); const l = await redisGet(k); if (!l) return tgSend(chatId, `Nao encontrada`); l.ativa = false; await redisSet(k, JSON.stringify(l)); await tgSend(chatId, `Revogada`); return; }
-    if (cmd === '/deletar') { const k = args[1]; if (!k) return tgSend(chatId, `/deletar <chave>`); await redisDel(k); await tgSend(chatId, `Deletada: <code>${k}</code>`); return; }
-    if (cmd === '/deletartudo') { const keys = await redisKeys('JETIX-*'); for (const k of keys) await redisDel(k); await tgSend(chatId, `<b>${keys.length}</b> licencas apagadas.`); return; }
-    if (cmd === '/stats') { const keys = await redisKeys('JETIX-*'); let ativas=0, exp=0, vinc=0, life=0, receita=0; for (const k of keys) { const l = await redisGet(k); if (!l) continue; if (l.ativa) ativas++; if (!l.lifetime && l.expiraEm < Date.now()) exp++; if (l.installId) vinc++; if (l.lifetime) life++; if (l.preco) receita += Number(l.preco)||0; } await tgSend(chatId, `<b>${t(lang,'stats_title')}</b>\n<b>#</b> ${t(lang,'stats_total')}: <code>${keys.length}</code>\n<b>o</b> ${t(lang,'stats_active')}: <code>${ativas}</code>\n<b>x</b> ${t(lang,'stats_expired')}: <code>${exp}</code>\n<b>*</b> ${t(lang,'stats_linked')}: <code>${vinc}</code>\n<b>inf</b> ${t(lang,'stats_lifetime')}: <code>${life}</code>\n<b>$</b> ${t(lang,'stats_revenue')}: <code>${precoFmt(receita)}</code>`); return; }
+    if (cmd === '/deletar') { const k = args[1]; if (!k) return tgSend(chatId, `/deletar <chave>`); await redisDel(k); await tgSend(chatId, `Deletada`); return; }
+    if (cmd === '/stats') { const keys = await redisKeys('JETIX-*'); let ativas=0, exp=0, life=0, receita=0; for (const k of keys) { const l = await redisGet(k); if (!l) continue; if (l.ativa) ativas++; if (!l.lifetime && l.expiraEm < Date.now()) exp++; if (l.lifetime) life++; if (l.preco) receita += Number(l.preco)||0; } await tgSend(chatId, `<b>Stats</b>\nTotal: <code>${keys.length}</code>\nAtivas: <code>${ativas}</code>\nExpiradas: <code>${exp}</code>\nLifetime: <code>${life}</code>\nReceita: <code>${precoFmt(receita)}</code>`); return; }
     await tgSend(chatId, `Use /start`);
   } catch (e) { log('ERRO', 'Message: ' + e.message); }
 }
 
 // ═══════════════════════════════════════════════════════════════
-// ROTAS HTTP
+// ROTAS BASE
 // ═══════════════════════════════════════════════════════════════
 app.get('/', (req, res) => res.json({ ok: true, service: 'prolince', version: '1.0.0' }));
 app.get('/health', (req, res) => res.json({ ok: true, uptime: Math.floor(process.uptime()) }));
 app.get('/v1/health', (req, res) => res.json({ ok: true, status: 'healthy', version: '1.0.0', timestamp: new Date().toISOString() }));
 
+// ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/key-exchange (POST) — Handshake ECDH
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/auth/key-exchange', async (req, res) => {
+  try {
+    const { publicKey, fingerprint } = req.body || {};
+    log('JETIX', `key-exchange fp=${(fingerprint||'').substring(0,12)}... pkLen=${(publicKey||'').length}`);
+    if (!publicKey || !fingerprint) return res.status(400).json({ error: 'missing_params' });
+    const sessionKey = await deriveSessionKey(publicKey);
+    const serverPubRaw = SERVER_ECDH.publicKey.export({ format: 'der', type: 'spki' }).subarray(26).toString('base64');
+    const sessionId = crypto.randomUUID();
+    SESSIONS.set(sessionId, { key: sessionKey, fingerprint, createdAt: Date.now() });
+    log('JETIX', `✓ Session ${sessionId.substring(0,8)} criada para fp=${fingerprint.substring(0,12)}...`);
+    return res.json({ success: true, data: { serverPublicKey: serverPubRaw, sessionId } });
+  } catch (e) {
+    log('ERRO', 'key-exchange: ' + e.message);
+    return res.status(500).json({ error: 'key_exchange_failed', message: e.message });
+  }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/bot-info (GET)
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/auth/bot-info', (req, res) => {
+  res.json({ username: 'ProlinceBot' });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/verify (GET)
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/auth/verify', (req, res) => {
+  const fp = req.query.fingerprint || req.headers['x-fingerprint'] || '';
+  log('JETIX', `verify fp=${fp.substring(0,12)}...`);
+  // Retorna uma sessão "válida" básica — Jetix vai mostrar o dashboard
+  return res.json({
+    success: true,
+    data: {
+      user: {
+        id: 1,
+        username: 'prolince_user',
+        effective_tier: 'premium',
+        effective_status: 'active',
+        has_active_extension: true,
+        has_active_credit: true,
+        is_banned: false,
+        subscription_end: null
+      },
+      sessionToken: jwt.sign({ sub: fp, tier: 'premium' }, PRIVATE_KEY || 'fallback', { algorithm: PRIVATE_KEY ? 'ES256' : 'HS256', expiresIn: '7d' }),
+      formFillDefaults: { country: 'US', name: 'John Doe', email: 'user@example.com' }
+    }
+  });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/redeem (POST) — Resgatar key JETIX
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/auth/redeem', async (req, res) => {
+  const { code, fingerprint } = req.body || {};
+  log('JETIX', `redeem code=${code} fp=${(fingerprint||'').substring(0,12)}...`);
+  if (!code) return res.status(400).json({ error: 'missing_code' });
+  const key = normalizeKey(code);
+  const lic = await redisGet(key);
+  if (!lic) return res.status(404).json({ error: 'invalid_license' });
+  if (!lic.ativa) return res.status(403).json({ error: 'revoked' });
+  if (!lic.lifetime && Date.now() > lic.expiraEm) return res.status(403).json({ error: 'expired' });
+  if (!lic.installId) { lic.installId = fingerprint; lic.ativadaEm = Date.now(); await redisSet(key, JSON.stringify(lic)); }
+  return res.json({ success: true, data: { tier: 'premium', plan: lic.plano, expiresAt: lic.expiraEm, licenseKey: key } });
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX — Outros endpoints /api/*
+// ═══════════════════════════════════════════════════════════════
+app.get('/api/data/address', (req, res) => {
+  const country = req.query.country || 'US';
+  return res.json({
+    success: true,
+    data: {
+      countryCode: country, zip: '10001', city: 'New York', state: 'NY',
+      street: '123 Main St', line1: '123 Main St', line2: 'Apt 4B',
+      phone: '555-0100', email: 'user@example.com',
+      firstName: 'John', lastName: 'Doe'
+    }
+  });
+});
+app.get('/api/data/user', (req, res) => res.json({ success: true, data: { id: 1, username: 'prolince_user', tier: 'premium' } }));
+app.get('/api/config/selectors', (req, res) => res.json({ success: true, data: { selectors: {}, uiInteraction: null } }));
+app.post('/api/tracking/log', (req, res) => { log('JETIX', `tracking: ${JSON.stringify(req.body).substring(0,100)}`); res.json({ ok: true }); });
+app.post('/api/stats/sync', (req, res) => { log('JETIX', `stats-sync: ${JSON.stringify(req.body).substring(0,100)}`); res.json({ ok: true, received: true }); });
+app.post('/api/bypass/instructions', (req, res) => res.json({ success: true, data: { instructions: [], rules: [] } }));
+app.get('/api/session-rules', (req, res) => res.json({ success: true, data: { rules: [] } }));
+app.post('/api/proxy/test', (req, res) => res.json({ success: true, data: { ok: true, ip: '127.0.0.1' } }));
+app.post('/api/proxy/test-geo', (req, res) => res.json({ success: true, data: { country: 'US', city: 'New York' } }));
+
+// ═══════════════════════════════════════════════════════════════
+// PROLINCE — /v1/activate, /v1/verify, /v1/campaign
+// ═══════════════════════════════════════════════════════════════
 app.post('/v1/activate', async (req, res) => {
   const { installId, licenseKey } = req.body || {};
   log('ATIV', `installId=${installId || '?'} key=${licenseKey || '(vazia)'}`);
@@ -280,6 +365,9 @@ app.post('/v1/verify', (req, res) => {
 
 app.get('/v1/campaign', (req, res) => res.json({ ok:true, campaign:null, serverTime:Date.now() }));
 
+// ═══════════════════════════════════════════════════════════════
+// WEBHOOK TELEGRAM
+// ═══════════════════════════════════════════════════════════════
 app.post('/telegram-webhook', async (req, res) => {
   res.sendStatus(200);
   const update = req.body || {};
@@ -298,8 +386,13 @@ app.listen(PORT, () => {
   log('SYS', `Chave EC: ${PRIVATE_KEY ? 'OK' : 'FALTA'}`);
   log('SYS', `Telegram: ${TELEGRAM_TOKEN ? 'OK' : 'FALTA'}`);
   log('SYS', `Owner ID: ${OWNER_ID || 'FALTA'}`);
-  log('OK',  `Bot Telegram completo (menu, gerar, listar, stats, /resp)`);
-  log('OK',  `Rota /telegram-webhook ativa`);
+  log('JETIX', `✔ /api/auth/key-exchange (ECDH + HKDF + AES-GCM)`);
+  log('JETIX', `✔ /api/auth/verify`);
+  log('JETIX', `✔ /api/auth/bot-info`);
+  log('JETIX', `✔ /api/auth/redeem`);
+  log('JETIX', `✔ /api/data/* + /api/config/* + /api/stats/* + /api/proxy/*`);
+  log('JETIX', `✔ Key formato JETIX-XXXX-XXXX-XXXX`);
+  log('OK',  `Bot Telegram completo`);
 });
 
 process.on('uncaughtException', e => log('ERRO', 'Uncaught: ' + e.message));
