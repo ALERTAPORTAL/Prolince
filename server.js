@@ -86,7 +86,7 @@ function validateBearer(req) {
 // ═══════════════════════════════════════════════════════════════
 function generateLicenseKey() {
   const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  const b = () => { let s=''; for (let i=0;i<4;i++) s+=chars[crypto.randomInt(0,chars.length)]; return s; };
+  const b = () => { let s=''; for (let i=0;i<5;i++) s+=chars[crypto.randomInt(0,chars.length)]; return s; };
   return `JETIX-${b()}-${b()}-${b()}`;
 }
 function formatDate(ts) { if (!ts) return 'Nunca'; return new Date(ts).toLocaleString('pt-BR',{timeZone:'America/Sao_Paulo',day:'2-digit',month:'2-digit',year:'numeric',hour:'2-digit',minute:'2-digit'}); }
