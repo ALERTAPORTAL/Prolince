@@ -77,4 +77,6 @@ app.listen(PORT, () => {
   log('SYS', `Prolince v1.0.0 na porta ${PORT}`);
   log('SYS', `Redis: ${UPSTASH_URL ? 'OK' : 'FALTA'}`);
   log('SYS', `Chave EC: ${PRIVATE_KEY ? 'OK' : 'FALTA'}`);
+  log('SYS', `Telegram: ${process.env.TELEGRAM_TOKEN ? 'OK' : 'FALTA'}`);
+  log('SYS', `Owner ID: ${process.env.OWNER_ID || 'FALTA'}`);
 });
