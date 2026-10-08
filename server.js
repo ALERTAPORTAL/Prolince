@@ -2,6 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const fs = require('fs');
 
 const app = express();
 app.use(express.json({ limit: '1mb' }));
@@ -15,7 +16,24 @@ app.use((req, res, next) => {
 
 const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
 const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
-const PRIVATE_KEY = (process.env.EC_PRIVATE_KEY || '').replace(/\\n/g, '\n').trim();
+
+// ── Carrega chaves EC: tenta Secret File, depois env var, depois base64 ──
+function loadKey(name) {
+  const paths = [`/etc/secrets/${name}`, `./${name}`];
+  for (const p of paths) {
+    try { if (fs.existsSync(p)) return fs.readFileSync(p, 'utf8').trim(); } catch {}
+  }
+  let v = process.env[name] || process.env[name === 'EC_PRIVATE_KEY' ? 'EC_PRIVATE_KEY' : 'EC_PUBLIC_KEY'] || '';
+  v = v.trim();
+  if (!v) return '';
+  if (!v.includes('BEGIN')) {
+    try { v = Buffer.from(v, 'base64').toString('utf8'); } catch {}
+  }
+  return v.replace(/\\n/g, '\n').trim();
+}
+
+const PRIVATE_KEY = loadKey('EC_PRIVATE_KEY');
+const PUBLIC_KEY  = loadKey('EC_PUBLIC_KEY');
 
 const log = (tag, msg) => console.log(`[${new Date().toISOString().substring(11,19)}] ▸ ${tag.padEnd(6)} ${msg}`);
 
@@ -39,6 +57,7 @@ app.post('/v1/activate', async (req, res) => {
   const { installId, licenseKey } = req.body || {};
   log('ATIV', `installId=${installId || '?'} key=${licenseKey || '(vazia)'}`);
   if (!installId) return res.status(400).json({ error: 'missing_installId' });
+  if (!PRIVATE_KEY) return res.status(500).json({ error: 'server_misconfigured' });
   if (!licenseKey) {
     const now = Math.floor(Date.now()/1000);
     const token = signToken({ sub: installId, tier: 'free', iat: now, exp: now + 2592000 });
