@@ -257,6 +257,58 @@ app.post('/api/auth/key-exchange', async (req, res) => {
 });
 
 // ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/login (POST) — Envia OTP via Telegram
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { telegramId } = req.body || {};
+    log('JETIX', `login telegramId=${telegramId}`);
+    if (!telegramId) return res.status(400).json({ error: 'missing_telegramId' });
+    const otp = String(crypto.randomInt(100000, 999999));
+    await redisSet(`OTP-${telegramId}`, JSON.stringify({ otp, createdAt: Date.now(), expiresAt: Date.now() + 10*60*1000 }));
+    if (TELEGRAM_TOKEN) {
+      await fetch(`https://api.telegram.org/bot${TELEGRAM_TOKEN}/sendMessage`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: telegramId, text: `🔐 Seu código Jetix: <code>${otp}</code>\n\nExpira em 10 minutos.`, parse_mode: 'HTML' })
+      }).catch(e => log('TG', 'send otp erro: ' + e.message));
+    }
+    log('OK', `OTP gerado para ${telegramId}: ${otp}`);
+    return res.json({ success: true, data: { sent: true, telegramId } });
+  } catch (e) { log('ERRO', 'login: ' + e.message); return res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// JETIX — /api/auth/verify-otp (POST) — Valida OTP e devolve user
+// ═══════════════════════════════════════════════════════════════
+app.post('/api/auth/verify-otp', async (req, res) => {
+  try {
+    const { telegramId, otp } = req.body || {};
+    log('JETIX', `verify-otp telegramId=${telegramId} otp=${otp}`);
+    if (!telegramId || !otp) return res.status(400).json({ error: 'missing_params' });
+    const stored = await redisGet(`OTP-${telegramId}`);
+    if (!stored) return res.status(404).json({ error: 'no_otp' });
+    if (Date.now() > stored.expiresAt) { await redisDel(`OTP-${telegramId}`); return res.status(403).json({ error: 'otp_expired' }); }
+    if (String(stored.otp) !== String(otp)) return res.status(403).json({ error: 'otp_invalid' });
+    await redisDel(`OTP-${telegramId}`);
+    const sessionToken = jwt.sign({ sub: String(telegramId), tier: 'premium', kind: 'session' }, PRIVATE_KEY || 'fallback', { algorithm: PRIVATE_KEY ? 'ES256' : 'HS256', expiresIn: '30d' });
+    log('OK', `login OK para ${telegramId}`);
+    return res.json({
+      success: true,
+      data: {
+        sessionToken,
+        user: {
+          id: telegramId, telegram_id: telegramId, username: 'user_' + telegramId,
+          effective_tier: 'premium', effective_status: 'active',
+          has_active_extension: true, has_active_credit: true,
+          is_banned: false, subscription_end: null
+        },
+        formFillDefaults: { country: 'US', name: 'John Doe', email: 'user@example.com' }
+      }
+    });
+  } catch (e) { log('ERRO', 'verify-otp: ' + e.message); return res.status(500).json({ error: e.message }); }
+});
+
+// ═══════════════════════════════════════════════════════════════
 // JETIX — /api/auth/bot-info (GET)
 // ═══════════════════════════════════════════════════════════════
 app.get('/api/auth/bot-info', (req, res) => {
@@ -394,6 +446,8 @@ app.listen(PORT, () => {
   log('SYS', `Telegram: ${TELEGRAM_TOKEN ? 'OK' : 'FALTA'}`);
   log('SYS', `Owner ID: ${OWNER_ID || 'FALTA'}`);
   log('JETIX', `✔ /api/auth/key-exchange (ECDH + HKDF + AES-GCM)`);
+  log('JETIX', `✔ /api/auth/login (OTP via Telegram)`);
+  log('JETIX', `✔ /api/auth/verify-otp`);
   log('JETIX', `✔ /api/auth/verify`);
   log('JETIX', `✔ /api/auth/bot-info`);
   log('JETIX', `✔ /api/auth/redeem`);
